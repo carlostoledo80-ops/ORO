@@ -38,11 +38,15 @@ import pandas as pd
 TICKER = "GC=F"
 TICKER_FALLBACK = "GLD"
 
-# Apertura de sesion para el analisis intradia, en hora de Nueva York.
-# 9:30 ET se elige a proposito: siempre cae DESPUES de tu alerta de las
-# 8:20 COT, tanto en horario de verano como de invierno de EE.UU.
-SESION_HORA_ET = 9
-SESION_MIN_ET = 30
+# Hora de la ventana intradia, en hora de Nueva York.
+# 10:00 ET se elige por tres razones:
+#   1. El feed de GC=F alinea sus barras EN PUNTO, no a la media hora.
+#   2. Siempre cae DESPUES de tu alerta de las 8:20 COT (que es 9:20 ET en
+#      horario de verano de EE.UU. y 8:20 ET en invierno).
+#   3. Coincide con el fixing PM de Londres (15:00 alli), un evento real
+#      de liquidez en el oro.
+SESION_HORA_ET = 10
+SESION_MIN_ET = 0
 
 # Que cuenta como "subida" en la primera hora. El oro se mueve menos que
 # una accion individual; 0.3% es un umbral razonable, no 2%.
@@ -146,14 +150,30 @@ def datos_oro():
 
 
 def primera_hora(h60: pd.DataFrame) -> pd.DataFrame:
-    """Extrae la barra de apertura de sesion -> open, max, cierre de la 1a hora."""
+    """Extrae la barra de sesion -> open, max, cierre de esa hora.
+
+    El futuro de oro cotiza casi 24h y su feed puede alinear las barras en
+    punto o a la media hora. En vez de exigir una alineacion concreta,
+    probamos las candidatas y nos quedamos con la que MAS sesiones tenga.
+    Exigir un match exacto fue justo el bug de la primera version: encontraba
+    3 barras sueltas y nunca activaba el plan B.
+    """
     idx = h60.index
     idx = idx.tz_localize("UTC") if idx.tz is None else idx
     idx = idx.tz_convert("America/New_York")
     h = h60.set_index(idx)
-    sel = h[(h.index.hour == SESION_HORA_ET) & (h.index.minute == SESION_MIN_ET)]
-    if sel.empty:  # algunos feeds alinean a la hora en punto
-        sel = h[(h.index.hour == SESION_HORA_ET) & (h.index.minute == 0)]
+
+    sel, elegida = None, None
+    for mm in (SESION_MIN_ET, 0, 30):
+        s = h[(h.index.hour == SESION_HORA_ET) & (h.index.minute == mm)]
+        if sel is None or len(s) > len(sel):
+            sel, elegida = s, (SESION_HORA_ET, mm)
+    log.info("Barra de sesion elegida: %02d:%02d ET -> %d sesiones",
+             elegida[0], elegida[1], len(sel))
+    if len(sel) < 100:
+        disponibles = (pd.Series(h.index.strftime("%H:%M")).value_counts().head(6))
+        log.warning("Pocas sesiones (%d). Horarios mas frecuentes en el feed:\n%s",
+                    len(sel), disponibles.to_string())
     out = pd.DataFrame(
         {"open": sel["Open"].values, "fh_max": sel["High"].values,
          "fh_close": sel["Close"].values},
@@ -344,6 +364,8 @@ def pc(x):
 
 def bloque(nombre, res, extra=""):
     L = [f"— {nombre} —"]
+    if extra:
+        L.append(f"  {extra}")
     if res is None:
         L.append("  sin datos")
         return L
@@ -360,8 +382,6 @@ def bloque(nombre, res, extra=""):
         L.append("  * neta negativa: los costos se comen la ventaja")
     else:
         L.append("  * la neta cruza cero: no se distingue de cero")
-    if extra:
-        L.append(f"  {extra}")
     return L
 
 
